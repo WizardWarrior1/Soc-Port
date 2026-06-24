@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""
+Phishing Email Detector
+Analyzes .eml files for phishing indicators and produces a threat score.
+"""
+
+import email
+import re
+import json
+import argparse
+import os
+from email import policy
+from urllib.parse import urlparse
+
+# ─── Keyword Lists ────────────────────────────────────────────────────────────
+PHISHING_KEYWORDS = [
+    "verify your account", "confirm your identity", "unusual activity",
+    "your account has been suspended", "click here immediately",
+    "update your payment", "limited time", "act now", "urgent action required",
+    "your password will expire", "validate your information",
+]
+
+SUSPICIOUS_TLDS = [".xyz", ".top", ".click", ".gq", ".ml", ".cf", ".tk"]
+
+HOMOGLYPH_PAIRS = [("0", "o"), ("1", "l"), ("rn", "m"), ("vv", "w")]
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+def extract_urls(text: str) -> list[str]:
+    pattern = re.compile(r'https?://[^\s<>"\']+')
+    return list(set(pattern.findall(text)))
+
+
+def check_homoglyphs(domain: str) -> list[str]:
+    findings = []
+    for (fake, real) in HOMOGLYPH_PAIRS:
+        if fake in domain:
+            findings.append(f"Possible homoglyph: '{fake}' may substitute '{real}' in '{domain}'")
+    return findings
+
+
+def check_suspicious_tld(domain: str) -> bool:
+    return any(domain.endswith(tld) for tld in SUSPICIOUS_TLDS)
+
+
+def score_email(findings: dict) -> int:
+    score = 0
+    if findings.get("spf_fail"):
+        score += 25
+    if findings.get("dkim_missing"):
+        score += 20
+    if findings.get("reply_to_mismatch"):
+        score += 15
+    score += min(len(findings.get("suspicious_urls", [])) * 10, 30)
+    score += len(findings.get("homoglyphs", [])) * 10
+    score += len(findings.get("keywords_found", [])) * 5
+    return min(score, 100)
+
+
+def interpret_score(score: int) -> str:
+    if score <= 20:
+        return "CLEAN ✅"
+    elif score <= 50:
+        return "SUSPICIOUS ⚠️"
+    else:
+        return "LIKELY PHISHING 🚨"
+
+
+# ─── Main Analysis ────────────────────────────────────────────────────────────
+def analyze_email(filepath: str) -> dict:
+    with open(filepath, "rb") as f:
+        msg = email.message_from_binary_file(f, policy=policy.default)
+
+    findings = {
+        "file": filepath,
+        "from": msg.get("From", "Unknown"),
+        "reply_to": msg.get("Reply-To", ""),
+        "subject": msg.get("Subject", "(no subject)"),
+        "date": msg.get("Date", ""),
+        "spf_fail": False,
+        "dkim_missing": False,
+        "reply_to_mismatch": False,
+        "suspicious_urls": [],
+        "homoglyphs": [],
+        "keywords_found": [],
+        "suspicious_tlds": [],
+    }
+
+    # Check SPF/DKIM in Authentication-Results header
+    auth_results = msg.get("Authentication-Results", "")
+    if "spf=fail" in auth_results.lower() or not auth_results:
+        findings["spf_fail"] = True
+    if "dkim=pass" not in auth_results.lower():
+        findings["dkim_missing"] = True
+
+    # Reply-To mismatch
+    from_addr = re.search(r'<(.+?)>', findings["from"])
+    reply_addr = re.search(r'<(.+?)>', findings["reply_to"])
+    if from_addr and reply_addr and from_addr.group(1) != reply_addr.group(1):
+        findings["reply_to_mismatch"] = True
+
+    # Extract body text
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype in ("text/plain", "text/html"):
+                body += part.get_content()
+    else:
+        body = msg.get_content()
+
+    # URL analysis
+    urls = extract_urls(body)
+    for url in urls:
+        domain = urlparse(url).netloc
+        if check_suspicious_tld(domain):
+            findings["suspicious_urls"].append(url)
+        hg = check_homoglyphs(domain)
+        findings["homoglyphs"].extend(hg)
+
+    # Keyword scan
+    body_lower = body.lower()
+    for kw in PHISHING_KEYWORDS:
+        if kw in body_lower:
+            findings["keywords_found"].append(kw)
+
+    findings["threat_score"] = score_email(findings)
+    findings["verdict"] = interpret_score(findings["threat_score"])
+    return findings
+
+
+def print_report(findings: dict):
+    sep = "═" * 50
+    print(f"\n{sep}")
+    print("  PHISHING EMAIL ANALYSIS REPORT")
+    print(sep)
+    print(f"  File:       {findings['file']}")
+    print(f"  From:       {findings['from']}")
+    print(f"  Subject:    {findings['subject']}")
+    print(f"  Date:       {findings['date']}")
+    print()
+
+    checks = [
+        ("SPF Fail", findings["spf_fail"]),
+        ("DKIM Missing", findings["dkim_missing"]),
+        ("Reply-To Mismatch", findings["reply_to_mismatch"]),
+    ]
+    for label, triggered in checks:
+        status = "[FAIL]" if triggered else "[ OK ]"
+        print(f"  {status}  {label}")
+
+    if findings["suspicious_urls"]:
+        print(f"\n  Suspicious URLs ({len(findings['suspicious_urls'])}):")
+        for url in findings["suspicious_urls"]:
+            print(f"    → {url}")
+
+    if findings["keywords_found"]:
+        print(f"\n  Phishing Keywords Found:")
+        for kw in findings["keywords_found"]:
+            print(f"    → \"{kw}\"")
+
+    if findings["homoglyphs"]:
+        print(f"\n  Homoglyph Warnings:")
+        for h in findings["homoglyphs"]:
+            print(f"    ⚠  {h}")
+
+    print(f"\n  Threat Score: {findings['threat_score']}/100")
+    print(f"  Verdict:      {findings['verdict']}")
+    print(sep + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Phishing Email Detector")
+    parser.add_argument("--file", required=True, help="Path to .eml file")
+    parser.add_argument("--output", help="Save JSON report to file")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.file):
+        print(f"[ERROR] File not found: {args.file}")
+        return
+
+    findings = analyze_email(args.file)
+    print_report(findings)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(findings, f, indent=2)
+        print(f"[*] Report saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

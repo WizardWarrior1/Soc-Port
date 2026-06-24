@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+Network Traffic Analyzer
+Parses PCAP files and detects suspicious patterns using Scapy.
+"""
+
+import argparse
+import json
+import os
+import statistics
+from collections import defaultdict
+
+try:
+    from scapy.all import rdpcap, IP, TCP, UDP, DNS, DNSQR
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    print("[WARN] Scapy not installed. Run: pip install scapy")
+
+# ─── Thresholds ───────────────────────────────────────────────────────────────
+PORT_SCAN_THRESHOLD  = 15     # Unique ports within window
+BEACON_STDDEV        = 2.0    # Max interval std deviation (seconds)
+BEACON_MIN_CONNS     = 5      # Min connections to flag beaconing
+DNS_TUNNEL_LEN       = 50     # Min query length for DNS tunnel flag
+EXFIL_THRESHOLD_MB   = 100    # Outbound transfer size in MB
+
+PRIVATE_RANGES = [
+    ("10.0.0.0",     "10.255.255.255"),
+    ("172.16.0.0",   "172.31.255.255"),
+    ("192.168.0.0",  "192.168.255.255"),
+]
+
+
+def ip_to_int(ip: str) -> int:
+    parts = ip.split(".")
+    return sum(int(p) << (8 * (3 - i)) for i, p in enumerate(parts))
+
+
+def is_private(ip: str) -> bool:
+    try:
+        n = ip_to_int(ip)
+        for start, end in PRIVATE_RANGES:
+            if ip_to_int(start) <= n <= ip_to_int(end):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# ─── Detectors ────────────────────────────────────────────────────────────────
+def detect_port_scan(packets: list) -> list[dict]:
+    alerts = []
+    src_ports = defaultdict(set)
+    src_times = defaultdict(list)
+
+    for pkt in packets:
+        if IP in pkt and TCP in pkt:
+            src = pkt[IP].src
+            dst_port = pkt[TCP].dport
+            src_ports[src].add(dst_port)
+            src_times[src].append(float(pkt.time))
+
+    for src, ports in src_ports.items():
+        if len(ports) >= PORT_SCAN_THRESHOLD:
+            times = src_times[src]
+            duration = max(times) - min(times) if times else 0
+            alerts.append({
+                "type": "PORT_SCAN",
+                "severity": "HIGH",
+                "source_ip": src,
+                "unique_ports": len(ports),
+                "duration_seconds": round(duration, 1),
+                "recommendation": f"Block {src} at perimeter firewall",
+            })
+
+    return alerts
+
+
+def detect_beaconing(packets: list) -> list[dict]:
+    alerts = []
+    connections = defaultdict(list)
+
+    for pkt in packets:
+        if IP in pkt and TCP in pkt:
+            if pkt[TCP].flags & 0x02:  # SYN flag
+                key = (pkt[IP].src, pkt[IP].dst)
+                connections[key].append(float(pkt.time))
+
+    for (src, dst), times in connections.items():
+        if len(times) < BEACON_MIN_CONNS:
+            continue
+        times.sort()
+        intervals = [times[i+1] - times[i] for i in range(len(times)-1)]
+        if not intervals:
+            continue
+        avg_interval = statistics.mean(intervals)
+        std_interval = statistics.stdev(intervals) if len(intervals) > 1 else 0
+
+        if std_interval < BEACON_STDDEV and avg_interval > 1:
+            alerts.append({
+                "type": "C2_BEACONING",
+                "severity": "CRITICAL",
+                "source_ip": src,
+                "dest_ip": dst,
+                "connections": len(times),
+                "avg_interval_seconds": round(avg_interval, 2),
+                "std_deviation": round(std_interval, 3),
+                "recommendation": "Isolate host, block destination IP, investigate process",
+            })
+
+    return alerts
+
+
+def detect_dns_tunneling(packets: list) -> list[dict]:
+    alerts = []
+
+    for pkt in packets:
+        if DNS in pkt and DNSQR in pkt:
+            try:
+                query = pkt[DNSQR].qname.decode("utf-8", errors="ignore").rstrip(".")
+                if len(query) > DNS_TUNNEL_LEN:
+                    alerts.append({
+                        "type": "DNS_TUNNELING",
+                        "severity": "HIGH",
+                        "query": query,
+                        "query_length": len(query),
+                        "source_ip": pkt[IP].src if IP in pkt else "unknown",
+                        "recommendation": "Block DNS query domain, investigate endpoint for C2 tool",
+                    })
+            except Exception:
+                pass
+
+    return alerts
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def analyze_pcap(filepath: str, verbose: bool = False) -> list[dict]:
+    if not SCAPY_AVAILABLE:
+        print("[ERROR] Scapy is required. Install with: pip install scapy")
+        return []
+
+    print(f"[*] Loading PCAP: {filepath}")
+    packets = rdpcap(filepath)
+    print(f"[*] Loaded {len(packets)} packets\n")
+
+    all_alerts = []
+    all_alerts += detect_port_scan(packets)
+    all_alerts += detect_beaconing(packets)
+    all_alerts += detect_dns_tunneling(packets)
+
+    if not all_alerts:
+        print("[+] No suspicious patterns detected.")
+    else:
+        print(f"[!] {len(all_alerts)} detection(s):\n")
+        for a in all_alerts:
+            print(f"  [{a['severity']}] {a['type']}")
+            if verbose:
+                for k, v in a.items():
+                    if k not in ("type", "severity"):
+                        print(f"    {k}: {v}")
+            print()
+
+    return all_alerts
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Network Traffic Analyzer")
+    parser.add_argument("--file", required=True, help="Path to PCAP file")
+    parser.add_argument("--output", help="Save findings to JSON file")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.file):
+        print(f"[ERROR] File not found: {args.file}")
+        return
+
+    findings = analyze_pcap(args.file, verbose=args.verbose)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(findings, f, indent=2)
+        print(f"[*] Saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

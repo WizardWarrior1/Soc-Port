@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+Threat Intelligence Feed Aggregator
+Pulls from multiple open-source threat intel feeds and outputs unified blocklists.
+"""
+
+import requests
+import csv
+import json
+import argparse
+import os
+from datetime import datetime, timezone
+from io import StringIO
+
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+FEEDS = {
+    "feodo": {
+        "url": "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
+        "type": "ip",
+        "description": "Feodo Tracker — C2 Botnet IPs (Emotet, Trickbot, Dridex)",
+    },
+    "urlhaus": {
+        "url": "https://urlhaus.abuse.ch/downloads/csv_recent/",
+        "type": "url",
+        "description": "Abuse.ch URLhaus — Malware Distribution URLs",
+    },
+    "malwarebazaar_hashes": {
+        "url": "https://bazaar.abuse.ch/export/txt/sha256/recent/",
+        "type": "hash",
+        "description": "MalwareBazaar — Recent SHA256 malware hashes",
+    },
+}
+
+
+def pull_feodo() -> list[dict]:
+    """Pull Feodo Tracker IP blocklist."""
+    print("[*] Fetching Feodo Tracker ...")
+    try:
+        r = requests.get(FEEDS["feodo"]["url"], timeout=15)
+        iocs = []
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                iocs.append({"type": "ip", "value": line, "source": "feodo", "confidence": "HIGH"})
+        print(f"    ✓ {len(iocs)} IPs")
+        return iocs
+    except Exception as e:
+        print(f"    ✗ Failed: {e}")
+        return []
+
+
+def pull_urlhaus() -> list[dict]:
+    """Pull Abuse.ch URLhaus feed."""
+    print("[*] Fetching URLhaus ...")
+    try:
+        r = requests.get(FEEDS["urlhaus"]["url"], timeout=15)
+        iocs = []
+        reader = csv.DictReader(StringIO(r.text.lstrip("#")))
+        for row in reader:
+            url = row.get("url", "").strip()
+            if url:
+                iocs.append({"type": "url", "value": url, "source": "urlhaus", "confidence": "MEDIUM"})
+        print(f"    ✓ {len(iocs)} URLs")
+        return iocs
+    except Exception as e:
+        print(f"    ✗ Failed: {e}")
+        return []
+
+
+def pull_malwarebazaar() -> list[dict]:
+    """Pull MalwareBazaar SHA256 hashes."""
+    print("[*] Fetching MalwareBazaar ...")
+    try:
+        r = requests.get(FEEDS["malwarebazaar_hashes"]["url"], timeout=15)
+        iocs = []
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and len(line) == 64:
+                iocs.append({"type": "hash_sha256", "value": line, "source": "malwarebazaar", "confidence": "HIGH"})
+        print(f"    ✓ {len(iocs)} hashes")
+        return iocs
+    except Exception as e:
+        print(f"    ✗ Failed: {e}")
+        return []
+
+
+def deduplicate(iocs: list[dict]) -> list[dict]:
+    seen = set()
+    unique = []
+    for ioc in iocs:
+        key = (ioc["type"], ioc["value"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(ioc)
+    return unique
+
+
+def save_blocklist(iocs: list[dict], filepath: str):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ips     = [i for i in iocs if i["type"] == "ip"]
+    urls    = [i for i in iocs if i["type"] == "url"]
+    hashes  = [i for i in iocs if i["type"] == "hash_sha256"]
+
+    with open(filepath, "w") as f:
+        f.write(f"# Threat Intelligence Blocklist\n")
+        f.write(f"# Generated: {now}\n")
+        f.write(f"# IPs: {len(ips)} | URLs: {len(urls)} | Hashes: {len(hashes)}\n\n")
+
+        f.write("# ── IP BLOCKLIST ──\n")
+        for i in ips:
+            f.write(f"{i['value']:<20} # Source: {i['source']} [{i['confidence']}]\n")
+
+        f.write("\n# ── URL BLOCKLIST ──\n")
+        for i in urls:
+            f.write(f"# {i['value'][:100]}  [{i['source']}]\n")
+
+        f.write("\n# ── SHA256 HASH BLOCKLIST ──\n")
+        for i in hashes:
+            f.write(f"{i['value']}  # [{i['source']}]\n")
+
+    print(f"\n[+] Blocklist saved: {filepath}")
+    print(f"    Total IOCs: {len(iocs)} ({len(ips)} IPs, {len(urls)} URLs, {len(hashes)} hashes)")
+
+
+def save_csv(iocs: list[dict], filepath: str):
+    with open(filepath, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["type", "value", "source", "confidence"])
+        writer.writeheader()
+        writer.writerows(iocs)
+    print(f"[+] CSV saved: {filepath}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Threat Intel Feed Aggregator")
+    parser.add_argument("--all", action="store_true", help="Pull all feeds")
+    parser.add_argument("--feed", choices=list(FEEDS.keys()), help="Pull specific feed")
+    parser.add_argument("--format", choices=["txt", "csv", "json"], default="txt")
+    parser.add_argument("--output", default=os.path.join(OUTPUT_DIR, "blocklist.txt"))
+    args = parser.parse_args()
+
+    if not args.all and not args.feed:
+        parser.print_help()
+        return
+
+    all_iocs = []
+    if args.all or args.feed == "feodo":
+        all_iocs += pull_feodo()
+    if args.all or args.feed == "urlhaus":
+        all_iocs += pull_urlhaus()
+    if args.all or args.feed == "malwarebazaar_hashes":
+        all_iocs += pull_malwarebazaar()
+
+    all_iocs = deduplicate(all_iocs)
+
+    if args.format == "txt":
+        save_blocklist(all_iocs, args.output)
+    elif args.format == "csv":
+        save_csv(all_iocs, args.output.replace(".txt", ".csv"))
+    elif args.format == "json":
+        out = args.output.replace(".txt", ".json")
+        with open(out, "w") as f:
+            json.dump(all_iocs, f, indent=2)
+        print(f"[+] JSON saved: {out}")
+
+
+if __name__ == "__main__":
+    main()
